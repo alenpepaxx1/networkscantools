@@ -1,0 +1,253 @@
+# Copyright Alen Pepa 2025
+# Advanced Network Scanner with detailed nmap features and modern GUI
+#For educational and ethical use only.
+
+import sys
+import os
+import platform
+import requests
+import nmap
+from scapy.all import ARP, Ether, srp
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
+                               QListWidget, QTextEdit, QLabel, QLineEdit, QMessageBox,
+                               QHBoxLayout, QFormLayout)
+from PySide6.QtCore import QThread, Signal
+
+# Set nmap.exe path in Windows (if not in PATH)
+NMAP_PATH = r"C:\Program Files (x86)\Nmap"
+if NMAP_PATH not in os.environ["PATH"]:
+    os.environ["PATH"] += os.pathsep + NMAP_PATH
+
+# -- Helper functions --
+
+def get_device_vendor(mac):
+    vendors = {
+        "00:1A:79": "Apple Inc.",
+        "00:1B:44": "Cisco Systems",
+        "00:1C:B3": "Samsung Electronics",
+        "FC:FB:FB": "Amazon Technologies",
+        "00:24:E4": "Sony Corporation",
+    }
+    prefix = mac.upper()[0:8]
+    for k,v in vendors.items():
+        if prefix.startswith(k):
+            return v
+    return "Unknown Vendor"
+
+def get_geoip_info(ip):
+    try:
+        resp = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            city = data.get("city", "Unknown City")
+            region = data.get("region", "Unknown Region")
+            country = data.get("country", "Unknown Country")
+            org = data.get("org", "Unknown Org")
+            loc = data.get("loc", "Unknown Location")
+            return f"{city}, {region}, {country} | Org: {org} | Loc: {loc}"
+        else:
+            return "GeoIP: Not found"
+    except Exception as e:
+        return f"GeoIP error: {e}"
+
+def get_os_info_local():
+    try:
+        os_name = platform.system()
+        os_release = platform.release()
+        return f"{os_name} {os_release}"
+    except:
+        return "OS info not available"
+
+# --- Thread for network scanning (ARP scan) ---
+class ScanNetworkThread(QThread):
+    progress = Signal(str)
+    finished = Signal(list)
+
+    def __init__(self, ip_range):
+        super().__init__()
+        self.ip_range = ip_range
+
+    def run(self):
+        self.progress.emit(f"Scanning network on: {self.ip_range}")
+        arp = ARP(pdst=self.ip_range)
+        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = ether/arp
+        try:
+            ans, _ = srp(packet, timeout=3, verbose=0)
+            devices = []
+            for sent, received in ans:
+                devices.append({'ip': received.psrc, 'mac': received.hwsrc})
+                self.progress.emit(f"Found device: IP={received.psrc} MAC={received.hwsrc}")
+            self.finished.emit(devices)
+        except Exception as e:
+            self.progress.emit(f"Error scanning network: {e}")
+            self.finished.emit([])
+
+# --- Thread for advanced nmap scanning ---
+class NmapScanThread(QThread):
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, ip, mac, ports):
+        super().__init__()
+        self.ip = ip
+        self.mac = mac
+        self.ports = ports if ports.strip() else None
+
+    def run(self):
+        self.progress.emit(f"Starting nmap scan on {self.ip} with ports: {self.ports or 'default (top 1000)'}")
+        try:
+            nm = nmap.PortScanner()
+            args = '-sS -sV -O -sC -Pn'
+            if self.ports:
+                args += f" -p {self.ports}"
+            nm.scan(self.ip, arguments=args)
+
+            if self.ip not in nm.all_hosts():
+                self.progress.emit("No data found from nmap.")
+                self.finished.emit({})
+                return
+
+            scan_result = nm[self.ip]
+            vendor = get_device_vendor(self.mac)
+            geoip = get_geoip_info(self.ip)
+
+            res = {
+                'ip': self.ip,
+                'mac': self.mac,
+                'vendor': vendor,
+                'geoip': geoip,
+                'nmap': scan_result,
+            }
+            self.finished.emit(res)
+
+        except Exception as e:
+            self.progress.emit(f"Error during nmap scan: {e}")
+            self.finished.emit({})
+
+# --- GUI Application ---
+
+class NetworkScannerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Advanced Network Scanner - Alen Pepa")
+        self.resize(900, 700)
+
+        self.layout = QVBoxLayout(self)
+
+        self.label_os = QLabel(f"This computer: {get_os_info_local()}")
+        self.layout.addWidget(self.label_os)
+
+        form_layout = QFormLayout()
+        self.input_iprange = QLineEdit("192.168.1.0/24")
+        self.input_iprange.setPlaceholderText("IP Range (e.g. 192.168.1.0/24)")
+        self.input_ports = QLineEdit("")
+        self.input_ports.setPlaceholderText("Ports (e.g. 22,80,443 or 1-1000) - Optional")
+        form_layout.addRow("IP Range:", self.input_iprange)
+        form_layout.addRow("Ports:", self.input_ports)
+        self.layout.addLayout(form_layout)
+
+        self.btn_scan = QPushButton("Scan Network")
+        self.layout.addWidget(self.btn_scan)
+
+        self.list_devices = QListWidget()
+        self.layout.addWidget(self.list_devices)
+
+        self.text_details = QTextEdit()
+        self.text_details.setReadOnly(True)
+        self.layout.addWidget(self.text_details)
+
+        self.btn_scan.clicked.connect(self.start_scan)
+        self.list_devices.itemClicked.connect(self.device_clicked)
+
+        self.devices = []
+
+    def start_scan(self):
+        ip_range = self.input_iprange.text().strip()
+        if not ip_range:
+            QMessageBox.warning(self, "Error", "Please enter an IP range to scan!")
+            return
+
+        self.list_devices.clear()
+        self.text_details.clear()
+        self.devices.clear()
+
+        self.btn_scan.setEnabled(False)
+        self.text_details.append(f"Starting scan on {ip_range}...")
+
+        self.scan_thread = ScanNetworkThread(ip_range)
+        self.scan_thread.progress.connect(self.append_text)
+        self.scan_thread.finished.connect(self.scan_finished)
+        self.scan_thread.start()
+
+    def append_text(self, msg):
+        self.text_details.append(msg)
+
+    def scan_finished(self, devices):
+        self.btn_scan.setEnabled(True)
+        if not devices:
+            self.text_details.append("No devices found on the network.")
+            return
+
+        self.devices = devices
+        for d in devices:
+            vendor = get_device_vendor(d['mac'])
+            self.list_devices.addItem(f"{d['ip']} - {d['mac']} ({vendor})")
+
+    def device_clicked(self, item):
+        index = self.list_devices.currentRow()
+        if index < 0 or index >= len(self.devices):
+            return
+        device = self.devices[index]
+        ip = device['ip']
+        mac = device['mac']
+        ports = self.input_ports.text().strip()
+
+        self.text_details.append(f"\nScanning ports and OS for {ip}...")
+        self.nmap_thread = NmapScanThread(ip, mac, ports)
+        self.nmap_thread.progress.connect(self.append_text)
+        self.nmap_thread.finished.connect(self.show_nmap_result)
+        self.nmap_thread.start()
+
+    def show_nmap_result(self, res):
+        if not res or 'nmap' not in res:
+            self.text_details.append("No valid data received from nmap.")
+            return
+
+        nm = res['nmap']
+        self.text_details.append(f"\n-- Results for IP {res['ip']} --")
+        self.text_details.append(f"MAC: {res['mac']}")
+        self.text_details.append(f"Vendor: {res['vendor']}")
+        self.text_details.append(f"Location: {res['geoip']}")
+
+        hostnames = nm.get('hostnames', [])
+        if hostnames:
+            self.text_details.append(f"Hostname: {hostnames[0]['name']} ({hostnames[0]['type']})")
+        else:
+            self.text_details.append("Hostname: Not found")
+
+        osmatches = nm.get('osmatch', [])
+        if osmatches:
+            self.text_details.append(f"OS: {osmatches[0]['name']} (Accuracy: {osmatches[0]['accuracy']}%)")
+            osclasses = osmatches[0].get('osclass', [])
+            if osclasses:
+                for oc in osclasses:
+                    self.text_details.append(f"  OS Class: {oc.get('type', '')} {oc.get('vendor', '')} {oc.get('osfamily', '')} {oc.get('osgen', '')}")
+        else:
+            self.text_details.append("OS: Not identified")
+
+        self.text_details.append("Open ports:")
+        tcp_ports = nm.get('tcp', {})
+        if tcp_ports:
+            for port, info in tcp_ports.items():
+                self.text_details.append(f"  Port {port}: {info.get('name')} ({info.get('product','')}) - {info.get('state')}")
+        else:
+            self.text_details.append("  No open ports found")
+
+        self.text_details.append("\n-- Scan complete --")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = NetworkScannerApp()
+    window.show()
+    sys.exit(app.exec())
